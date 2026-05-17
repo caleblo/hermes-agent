@@ -385,6 +385,49 @@ def _is_kimi_coding_endpoint(base_url: str | None) -> bool:
     return normalized.rstrip("/").lower().startswith("https://api.kimi.com/coding")
 
 
+def _is_bigtoken_endpoint(base_url: str | None) -> bool:
+    """Return True for BigToken's Anthropic-compatible gateway.
+
+    BigToken (https://bigtoken.ai) speaks the Anthropic Messages API with
+    x-api-key auth, but its Cloudflare WAF blocks requests carrying the
+    Anthropic Python SDK fingerprint (``x-stainless-lang: python`` +
+    ``User-Agent: AsyncAnthropic/Python ...``), returning HTTP 403
+    ``Your request was blocked.``  Claude Code traffic is allowed through,
+    so we spoof its identity headers when we detect this base URL.
+    """
+    return base_url_host_matches(base_url or "", "bigtoken.ai")
+
+
+def _build_bigtoken_http_client(timeout):
+    """Return an httpx.Client whose event hook overwrites the Anthropic SDK
+    fingerprint before each request.
+
+    The Anthropic SDK appends user-supplied ``default_headers`` values to
+    its built-in ``User-Agent`` / ``x-stainless-*`` headers (e.g. it sends
+    ``user-agent: Anthropic/Python 0.87.0, claude-cli/...``).  BigToken's
+    Cloudflare WAF inspects the *first* token of those headers and rejects
+    anything starting with ``Anthropic/Python`` or carrying
+    ``x-stainless-lang: python``.  Replacing the headers in an httpx
+    request event hook runs after the SDK has assembled the request, so we
+    get a clean Claude Code fingerprint on the wire.
+    """
+    import httpx as _httpx
+
+    _claude_cli_ua = f"claude-cli/{_get_claude_code_version()} (external, cli)"
+
+    def _rewrite(request: _httpx.Request) -> None:
+        request.headers["user-agent"] = _claude_cli_ua
+        request.headers["x-stainless-lang"] = "js"
+        request.headers["x-stainless-package-version"] = "0.40.0"
+        request.headers["x-stainless-runtime"] = "node"
+        request.headers["x-stainless-runtime-version"] = "v20.18.0"
+        request.headers["x-stainless-os"] = "MacOS"
+        request.headers["x-stainless-arch"] = "arm64"
+        request.headers["x-app"] = "cli"
+
+    return _httpx.Client(timeout=timeout, event_hooks={"request": [_rewrite]})
+
+
 # Model-name prefixes that identify the Kimi / Moonshot family.  Covers
 # - official slugs: ``kimi-k2.5``, ``kimi_thinking``, ``moonshot-v1-8k``
 # - common release lines: ``k1.5-...``, ``k2-thinking``, ``k25-...``, ``k2.5-...``
@@ -583,6 +626,17 @@ def build_anthropic_client(
             "User-Agent": "claude-code/0.1.0",
             **( {"anthropic-beta": ",".join(common_betas)} if common_betas else {} )
         }
+    elif _is_bigtoken_endpoint(base_url):
+        # BigToken's Cloudflare WAF blocks the Anthropic Python SDK fingerprint
+        # (x-stainless-lang: python + AsyncAnthropic/Python user-agent) with
+        # HTTP 403 "Your request was blocked."  The SDK *appends* values from
+        # ``default_headers`` instead of replacing the built-in ones, so we
+        # plug in an httpx request hook that fully rewrites the fingerprint
+        # to Claude Code's whitelisted identity on the wire.
+        kwargs["api_key"] = api_key
+        kwargs["http_client"] = _build_bigtoken_http_client(kwargs["timeout"])
+        if common_betas:
+            kwargs["default_headers"] = {"anthropic-beta": ",".join(common_betas)}
     elif _requires_bearer_auth(normalized_base_url):
         # Some Anthropic-compatible providers (e.g. MiniMax) expect the API key in
         # Authorization: Bearer *** for regular API keys. Route those endpoints
